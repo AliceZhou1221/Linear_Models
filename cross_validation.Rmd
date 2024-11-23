@@ -1,0 +1,203 @@
+---
+title: "cross_validation"
+output: github_document
+date: "2024-11-23"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(modelr)
+library(mgcv)
+```
+
+```{r}
+library(SemiPar)
+
+set.seed(1)
+```
+
+look at Lidar data
+```{r}
+data(lidar)
+
+lidar_df = 
+  lidar |> 
+  as_tibble() |>
+  mutate(id = row_number())
+
+lidar_df |> 
+  ggplot(aes(x = range, y = logratio)) + 
+  geom_point()
+```
+## try to do CV
+compare 3 models: linear, smooth, wiggly
+```{r}
+train_df = sample_frac(lidar_df, size = 0.8)
+test_df = anti_join(lidar_df, train_df, by = "id")
+```
+
+```{r}
+ggplot(train_df, aes(x = range, y = logratio))+
+  geom_point()+
+  geom_point(data = test_df, color = "red")
+```
+fit 3 models
+```{r}
+linear_mod = lm(logratio~range, data = train_df)
+smooth_mod = gam(logratio ~ s(range), data = train_df)
+wiggly_mod = mgcv::gam(logratio ~ s(range, k = 30), sp = 10e-6, data = train_df)
+```
+To understand what these models have done, I’ll plot the two gam fits.
+```{r}
+train_df |> 
+  add_predictions(smooth_mod) |> 
+  ggplot(aes(x = range, y = logratio)) + 
+  geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+
+```
+
+```{r}
+train_df |> 
+  add_predictions(wiggly_mod) |> 
+  ggplot(aes(x = range, y = logratio)) + 
+  geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+
+```
+
+check for fits
+```{r}
+train_df |> 
+  add_predictions(linear_mod) |> 
+  ggplot(aes(x = range, y = logratio))+
+  geom_point()+
+  geom_line(aes(y = pred), color = "red")+
+  geom_point(data = test_df, color = "red")
+  
+```
+
+compare numerically using RMSE
+```{r}
+rmse(linear_mod, test_df)
+rmse(smooth_mod, test_df)
+rmse(wiggly_mod, test_df)
+```
+# CV using modelr
+modelr has tools to automate elements of the CV process. In particular, crossv_mc preforms the training / testing split multiple times, and stores the datasets using list columns.
+
+## repeat the train-test split
+```{r}
+cv_df = 
+  crossv_mc(lidar_df, 100)
+```
+crossv_mc tries to be smart about memory – rather than repeating the dataset a bunch of times, it saves the data once and stores the indexes for each training / testing split using a resample object. This can be coerced to a dataframe, and can often be treated exactly like a dataframe. However, it’s not compatible with gam, so we have to convert each training and testing dataset (and lose that nice memory-saving stuff in the process) using the code below. It’s worth noting, though, that if all the models you want to fit use lm, you can skip this.
+```{r}
+cv_df |> pull(train) |> nth(1) |> as_tibble()
+```
+```{r}
+cv_df |> pull(test) |> nth(1) |> as_tibble()
+```
+```{r}
+cv_df =
+  cv_df |> 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble))
+```
+I now have many training and testing datasets, and I’d like to fit my candidate models above and assess prediction accuracy as I did for the single training / testing split. To do this, I’ll fit models and obtain RMSEs using mutate + map & map2.
+
+```{r}
+cv_df = 
+  cv_df |> #fit the regression models on training data
+  mutate(
+    linear_mod  = map(train, \(df) lm(logratio ~ range, data = df)),
+    smooth_mod  = map(train, \(df) gam(logratio ~ s(range), data = df)),
+    wiggly_mod  = map(train, \(df) gam(logratio ~ s(range, k = 30), sp = 10e-6, data = df))) |> #calculate the RMSE for the model fit on test data
+  mutate(
+    rmse_linear = map2_dbl(linear_mod, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_smooth = map2_dbl(smooth_mod, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_wiggly = map2_dbl(wiggly_mod, test, \(mod, df) rmse(model = mod, data = df)))
+
+cv_df
+
+```
+see distribution of RMSE
+```{r}
+cv_df |> 
+  select(starts_with("rmse")) |> 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") |> 
+  mutate(model = fct_inorder(model))|> 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+# Example: Child Growth
+```{r}
+child_growth = read_csv("./data/nepalese_children.csv")
+```
+
+```{r}
+child_growth |> 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5)
+```
+The plots suggests some non-linearity, especially at the low end of the weight distribution. We’ll try three models: a linear fit; a piecewise linear fit; and a smooth fit using gam.
+```{r}
+child_growth =
+  child_growth |> 
+  mutate(weight_cp7 = (weight > 7) * (weight - 7))
+```
+```{r}
+linear_mod = lm(armc ~ weight, data = child_growth)
+pwl_mod    = lm(armc ~ weight + weight_cp7, data = child_growth)
+smooth_mod = gam(armc ~ s(weight), data = child_growth)
+```
+
+```{r}
+child_growth |> 
+  add_predictions(model = smooth_mod) |> 
+  ggplot(aes(x = weight, y = armc))+
+  geom_point(alpha = .5)+
+  geom_line(aes(y = pred), color = "red")
+```
+Do cross validation to select models
+```{r}
+cv_df =
+  crossv_mc(child_growth, 100) |> 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble))
+```
+```{r}
+cv_df = 
+  cv_df |> 
+  mutate(
+    linear_mod  = map(train, \(df) lm(armc ~ weight, data = df)),
+    pwl_mod     = map(train, \(df) lm(armc ~ weight + weight_cp7, data = df)),
+    smooth_mod  = map(train, \(df) gam(armc ~ s(weight), data = as_tibble(df)))) |> 
+  mutate(
+    rmse_linear = map2_dbl(linear_mod, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_pwl    = map2_dbl(pwl_mod, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_smooth = map2_dbl(smooth_mod, test, \(mod, df) rmse(model = mod, data = df)))
+```
+```{r}
+cv_df |> 
+  select(starts_with("rmse")) |> 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") |> 
+  mutate(model = fct_inorder(model)) |> 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+Based on these results, there’s clearly some improvement in predictive accuracy gained by allowing non-linearity – whether this is sufficient to justify a more complex model isn’t obvious, though. Among the non-linear models, the smooth fit from gam might be a bit better than the piecewise linear model. Which candidate model is best, though, depends a bit on the need to balance complexity with goodness of fit and interpretability. In the end, I’d probably go with the piecewise linear model – the non-linearity is clear enough that it should be accounted for, and the differences between the piecewise and gam fits are small enough that the easy interpretation of the piecewise model “wins”.
+
+
