@@ -1,0 +1,176 @@
+---
+title: "bootstrap"
+output: github_document
+date: "2024-11-23"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(p8105.datasets)
+library(modelr)
+
+set.seed(1)
+
+```
+
+```{r}
+n_samp = 250
+
+sim_df_const = 
+  tibble(
+    x = rnorm(n_samp, 1, 1),
+    error = rnorm(n_samp, 0, 1),
+    y = 2 + 3 * x + error
+  )
+
+sim_df_nonconst = sim_df_const |> 
+  mutate(
+  error = error * .75 * x,
+  y = 2 + 3 * x + error
+)
+```
+
+look at the datasets
+```{r}
+sim_df = 
+  bind_rows(const = sim_df_const, nonconst = sim_df_nonconst, .id = "data_source") 
+
+sim_df |> 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point(alpha = .5) +
+  stat_smooth(method = "lm") +
+  facet_grid(~data_source)
+```
+These datasets have roughly the same overall variance, but the left panel shows data with constant variance and the right panel shows data with non-constant variance. For this reason, ordinary least squares should provide reasonable estimates in both cases, but inference is standard inference approaches may only be justified for the data on the left.
+
+The output below shows results from fitting simple linear regressions to both datasets.
+```{r}
+lm(y ~ x, data = sim_df_const) |> 
+  broom::tidy() |> 
+  knitr::kable(digits = 3)
+```
+
+```{r}
+lm(y ~ x, data = sim_df_nonconst) |> 
+  broom::tidy() |> 
+  knitr::kable(digits = 3)
+```
+
+# Drawing one bootstrap sample
+```{r}
+boot_sample = function(df) {
+  boot_df =
+  sample_frac(df, replace = TRUE) |> 
+    arrange(x)
+  
+return(boot_df)
+}
+```
+let's try running the function
+```{r}
+#each sample gives a slightly different regression fit
+sim_df_nonconst |> 
+  boot_sample() |>  #a dataframe arranged by x
+  ggplot(aes(x = x, y = y))+
+  geom_point(alpha = 0.5)+
+  stat_smooth(method = "lm")
+```
+As an analysis
+```{r}
+sim_df_nonconst |> 
+  boot_sample() |> 
+  lm(y ~ x, data =_) |> 
+  broom::tidy() |> 
+  knitr::kable(digits = 2)
+```
+
+## Bootstrap a lot!
+```{r}
+boot_straps = 
+  tibble(
+    strap_number = 1:1000
+  ) |> 
+  mutate(
+    strap_sample = map(strap_number, \(i) boot_sample(df = sim_df_nonconst)),
+    models = map(strap_sample, \(df) lm(y ~ x, data = df)),
+    results = map(models, broom::tidy)
+  )
+
+# check data structure
+boot_straps |> 
+  pull(strap_sample) |> 
+  nth(1)
+
+boot_straps |> 
+  pull(models) |> 
+  nth(1)
+
+#bootstrap results
+bootstrap_results = 
+  boot_straps |> 
+  select(strap_number, results) |> 
+  unnest(results) |> 
+  group_by(term) |> 
+  summarize(
+    boot_se = sd(estimate)
+  )
+
+```
+## do this using modelr
+
+```{r}
+boot_straps = 
+  sim_df_nonconst |> 
+  modelr::bootstrap(1000) |> 
+  mutate(
+    strap = map(strap, as_tibble),
+    models = map(strap, \(df) lm(y ~ x, data = df)),
+    results = map(models, broom::tidy)
+  ) |> 
+  select(.id, results) |> 
+  unnest(results)
+```
+# Airbnb data
+```{r}
+data("nyc_airbnb")
+
+nyc_airbnb = 
+  nyc_airbnb |> 
+  mutate(stars = review_scores_location / 2) |> 
+  rename(
+    borough = neighbourhood_group,
+    neighborhood = neighbourhood) |> 
+  filter(borough != "Staten Island") |> 
+  drop_na(price, stars) |> 
+  select(price, stars, borough, neighborhood, room_type)
+```
+```{r}
+nyc_airbnb |> 
+  ggplot(aes(x = stars, y = price)) + 
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE)
+```
+fit a regression
+```{r}
+lm(price ~ stars + room_type, data = nyc_airbnb) |> 
+  broom::tidy()
+# we cannot trust the se in this case
+```
+bootstrap for (maybe) better inference
+```{r}
+nyc_airbnb |> 
+  modelr::bootstrap(1000) |> 
+  mutate(
+    strap = map(strap, as_tibble), 
+    models = map(strap, \(df) lm(price ~ stars + room_type, data = df)),
+    results = map(models, broom::tidy)
+  ) |> 
+  select(.id, results) |> 
+  unnest(results) |> 
+  filter(term =="stars") |> 
+  ggplot(aes(estimate))+
+  geom_density()
+```
+This distribution has a heavy tail extending to low values and a bit of a “shoulder”, features that may be related to the frequency with which large outliers are included in the bootstrap sample.
